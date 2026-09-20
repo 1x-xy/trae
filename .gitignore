@@ -1,0 +1,31 @@
+# ==================== 后端 Python ====================
+backend/venv/
+backend/__pycache__/
+__pycache__/
+backend/.pytest_cache/
+backend/*.pyc
+backend/.env
+
+# ==================== 前端 Node ====================
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+
+# ==================== 上传的图片（运行时生成） ====================
+backend/uploads/
+
+# ==================== 工具二进制 ====================
+tools/cloudflared.exe
+
+# ==================== 系统/编辑器 ====================
+.vscode/
+.idea/
+*.log
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ==================== 压缩备份 ====================
+*.zip
+*.rar
+*.7z

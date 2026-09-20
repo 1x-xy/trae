@@ -17,8 +17,6 @@ from decimal import Decimal
 from typing import Literal
 
 import bcrypt
-import pymysql
-from pymysql.cursors import DictCursor
 from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -29,11 +27,14 @@ from jose import jwt, JWTError
 # ------------------------------------------------------------------
 # 配置（可通过环境变量覆盖，便于本地/部署切换）
 # ------------------------------------------------------------------
+DB_TYPE = os.getenv("DB_TYPE", "mysql").lower()  # mysql 或 postgres
 DB_HOST = os.getenv("DB_HOST", "127.0.0.1")
 DB_PORT = int(os.getenv("DB_PORT", "3306"))
 DB_USER = os.getenv("DB_USER", "root")
 DB_PASSWORD = os.getenv("DB_PASSWORD", "root")
 DB_NAME = os.getenv("DB_NAME", "item_approval")
+# Render 会提供 DATABASE_URL，优先使用
+DATABASE_URL = os.getenv("DATABASE_URL", "")
 
 JWT_SECRET = os.getenv("JWT_SECRET", "item-approval-secret-key-change-me")
 JWT_ALGORITHM = "HS256"
@@ -66,19 +67,135 @@ app.mount("/static", StaticFiles(directory=os.path.join(BASE_DIR, "uploads")), n
 
 
 # ------------------------------------------------------------------
-# 数据库连接（每个请求一个连接）
+# 云端部署：PostgreSQL 环境启动时自动建表（免手动执行 SQL）
+# 本地 MySQL 环境仍使用 sql/init.sql 初始化，此函数直接跳过
+# ------------------------------------------------------------------
+@app.on_event("startup")
+def init_pg_tables():
+    if not _is_postgres():
+        return
+    import psycopg2
+    from psycopg2.extras import RealDictCursor
+
+    if DATABASE_URL:
+        conn = psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
+    else:
+        conn = psycopg2.connect(
+            host=DB_HOST, port=DB_PORT, user=DB_USER,
+            password=DB_PASSWORD, dbname=DB_NAME,
+            cursor_factory=RealDictCursor,
+        )
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS users (
+                    id            BIGSERIAL PRIMARY KEY,
+                    username      VARCHAR(50)  NOT NULL UNIQUE,
+                    password_hash VARCHAR(255) NOT NULL,
+                    uid           VARCHAR(20)  NOT NULL UNIQUE,
+                    created_at    TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS item_apply (
+                    id            BIGSERIAL PRIMARY KEY,
+                    user_id       BIGINT        NOT NULL REFERENCES users(id),
+                    item_name     VARCHAR(100) NOT NULL,
+                    price         NUMERIC(10,2) NOT NULL DEFAULT 0,
+                    description   TEXT          NULL,
+                    image_path    VARCHAR(255) NOT NULL,
+                    status        VARCHAR(20)  NOT NULL DEFAULT 'pending',
+                    reviewer_id   BIGINT        NULL REFERENCES users(id),
+                    review_reason VARCHAR(500) NULL,
+                    reviewed_at   TIMESTAMP     NULL,
+                    created_at    TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS approval_record (
+                    id          BIGSERIAL PRIMARY KEY,
+                    apply_id    BIGINT       NOT NULL REFERENCES item_apply(id),
+                    reviewer_id BIGINT       NOT NULL REFERENCES users(id),
+                    action      VARCHAR(20)  NOT NULL,
+                    reason      VARCHAR(500) NOT NULL,
+                    created_at  TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE (apply_id, reviewer_id)
+                )
+                """
+            )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS message (
+                    id         BIGSERIAL PRIMARY KEY,
+                    user_id    BIGINT       NOT NULL REFERENCES users(id),
+                    apply_id   BIGINT       NOT NULL REFERENCES item_apply(id),
+                    content    VARCHAR(500) NOT NULL,
+                    is_read    SMALLINT     NOT NULL DEFAULT 0,
+                    created_at TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS friendship (
+                    id         BIGSERIAL PRIMARY KEY,
+                    user_id    BIGINT    NOT NULL REFERENCES users(id),
+                    friend_id  BIGINT    NOT NULL REFERENCES users(id),
+                    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE (user_id, friend_id)
+                )
+                """
+            )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS friend_request (
+                    id           BIGSERIAL PRIMARY KEY,
+                    from_user_id BIGINT      NOT NULL REFERENCES users(id),
+                    to_user_id   BIGINT      NOT NULL REFERENCES users(id),
+                    status       VARCHAR(20) NOT NULL DEFAULT 'pending',
+                    created_at   TIMESTAMP   NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    handled_at   TIMESTAMP   NULL,
+                    UNIQUE (from_user_id, to_user_id)
+                )
+                """
+            )
+        conn.commit()
+        print("[startup] PostgreSQL 数据表已就绪（自动建表完成）")
+    except Exception as e:
+        conn.rollback()
+        print(f"[startup] 自动建表失败: {e}")
+    finally:
+        conn.close()
+
+
+# ------------------------------------------------------------------
+# 数据库连接（每个请求一个连接，根据 DB_TYPE 自动选择 MySQL 或 PostgreSQL）
 # ------------------------------------------------------------------
 def get_conn():
-    conn = pymysql.connect(
-        host=DB_HOST,
-        port=DB_PORT,
-        user=DB_USER,
-        password=DB_PASSWORD,
-        database=DB_NAME,
-        charset="utf8mb4",
-        cursorclass=DictCursor,
-        autocommit=False,
-    )
+    if DB_TYPE == "postgres" or DATABASE_URL:
+        import psycopg2
+        from psycopg2.extras import RealDictCursor
+        if DATABASE_URL:
+            conn = psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
+        else:
+            conn = psycopg2.connect(
+                host=DB_HOST, port=DB_PORT, user=DB_USER,
+                password=DB_PASSWORD, dbname=DB_NAME,
+                cursor_factory=RealDictCursor,
+            )
+    else:
+        import pymysql
+        from pymysql.cursors import DictCursor
+        conn = pymysql.connect(
+            host=DB_HOST, port=DB_PORT, user=DB_USER,
+            password=DB_PASSWORD, database=DB_NAME,
+            charset="utf8mb4", cursorclass=DictCursor, autocommit=False,
+        )
     try:
         yield conn
     finally:
@@ -88,6 +205,20 @@ def get_conn():
 # ------------------------------------------------------------------
 # 工具函数
 # ------------------------------------------------------------------
+def _is_postgres() -> bool:
+    """当前是否运行在 PostgreSQL 模式（本地默认 MySQL，云端走 PostgreSQL）。"""
+    return DB_TYPE == "postgres" or bool(DATABASE_URL)
+
+
+def _insert_returning_id(cur, sql: str, params: tuple):
+    """兼容 MySQL / PostgreSQL 的 INSERT：PostgreSQL 用 RETURNING id，MySQL 用 lastrowid。"""
+    if _is_postgres():
+        cur.execute(sql.rstrip(";") + " RETURNING id", params)
+        return cur.fetchone()["id"]
+    cur.execute(sql, params)
+    return cur.lastrowid
+
+
 def _bcrypt_digest(raw: str) -> bytes:
     # 先 SHA256 再 Base64（44 字节），保证任意长度密码都不超过 bcrypt 的 72 字节限制
     return base64.b64encode(hashlib.sha256(raw.encode("utf-8")).digest())
@@ -143,7 +274,7 @@ def current_user(
 
     with conn.cursor() as cur:
         cur.execute(
-            "SELECT id, username, uid, created_at FROM user WHERE id = %s", (user_id,)
+            "SELECT id, username, uid, created_at FROM users WHERE id = %s", (user_id,)
         )
         user = cur.fetchone()
     if not user:
@@ -194,23 +325,23 @@ class UidIn(BaseModel):
 def register(data: AuthIn, conn=Depends(get_conn)):
     username = data.username.strip()
     with conn.cursor() as cur:
-        cur.execute("SELECT id FROM user WHERE username = %s", (username,))
+        cur.execute("SELECT id FROM users WHERE username = %s", (username,))
         if cur.fetchone():
             raise HTTPException(status_code=400, detail="用户名已存在")
 
         # 生成唯一 uid，重试最多 100 次避免偶然碰撞
         for _ in range(100):
             uid = generate_uid()
-            cur.execute("SELECT id FROM user WHERE uid = %s", (uid,))
+            cur.execute("SELECT id FROM users WHERE uid = %s", (uid,))
             if not cur.fetchone():
                 break
 
-        cur.execute(
-            "INSERT INTO user (username, password_hash, uid) VALUES (%s, %s, %s)",
+        user_id = _insert_returning_id(
+            cur,
+            "INSERT INTO users (username, password_hash, uid) VALUES (%s, %s, %s)",
             (username, hash_password(data.password), uid),
         )
         conn.commit()
-        user_id = cur.lastrowid
     return {"id": user_id, "username": username, "uid": uid, "message": "注册成功"}
 
 
@@ -218,7 +349,7 @@ def register(data: AuthIn, conn=Depends(get_conn)):
 def login(data: AuthIn, conn=Depends(get_conn)):
     with conn.cursor() as cur:
         cur.execute(
-            "SELECT id, username, password_hash, uid FROM user WHERE username = %s",
+            "SELECT id, username, password_hash, uid FROM users WHERE username = %s",
             (data.username.strip(),),
         )
         user = cur.fetchone()
@@ -274,13 +405,13 @@ async def submit_application(
     image_path = f"/static/images/{filename}"
 
     with conn.cursor() as cur:
-        cur.execute(
+        apply_id = _insert_returning_id(
+            cur,
             """INSERT INTO item_apply
                (user_id, item_name, price, description, image_path, status)
                VALUES (%s, %s, %s, %s, %s, 'pending')""",
             (user["id"], item_name, price, description.strip(), image_path),
         )
-        apply_id = cur.lastrowid
 
         # 申报提交后第一时间推送给所有好友
         cur.execute(
@@ -326,7 +457,7 @@ def my_applications(user=Depends(current_user), conn=Depends(get_conn)):
                 f"""SELECT r.apply_id, r.action, r.reason, r.created_at,
                           u.id AS reviewer_id, u.username AS reviewer_name
                    FROM approval_record r
-                   INNER JOIN user u ON u.id = r.reviewer_id
+                   INNER JOIN users u ON u.id = r.reviewer_id
                    WHERE r.apply_id IN ({placeholders})
                    ORDER BY r.created_at ASC""",
                 app_ids,
@@ -348,7 +479,7 @@ def pending_for_me(user=Depends(current_user), conn=Depends(get_conn)):
         SELECT a.id, a.item_name, a.price, a.description, a.image_path,
                a.created_at, a.user_id, u.username AS applicant_name
         FROM item_apply a
-        INNER JOIN user u ON u.id = a.user_id
+        INNER JOIN users u ON u.id = a.user_id
         WHERE a.status = 'pending' AND a.user_id <> %s
           AND NOT EXISTS (
             SELECT 1 FROM approval_record r
@@ -541,12 +672,12 @@ def update_uid(data: UidIn, user=Depends(current_user), conn=Depends(get_conn)):
     with conn.cursor() as cur:
         # 检查是否被他人占用
         cur.execute(
-            "SELECT id FROM user WHERE uid = %s AND id <> %s",
+            "SELECT id FROM users WHERE uid = %s AND id <> %s",
             (new_uid, user["id"]),
         )
         if cur.fetchone():
             raise HTTPException(status_code=400, detail="该ID已被使用，请重新修改")
-        cur.execute("UPDATE user SET uid = %s WHERE id = %s", (new_uid, user["id"]))
+        cur.execute("UPDATE users SET uid = %s WHERE id = %s", (new_uid, user["id"]))
         conn.commit()
     return {"uid": new_uid, "message": "好友ID修改成功"}
 
@@ -559,7 +690,7 @@ def search_by_uid(q: str, user=Depends(current_user), conn=Depends(get_conn)):
         return []
     with conn.cursor() as cur:
         cur.execute(
-            """SELECT id, username, uid FROM user
+            """SELECT id, username, uid FROM users
                WHERE uid = %s AND id <> %s LIMIT 10""",
             (q, user["id"]),
         )
@@ -573,7 +704,7 @@ def list_friends(user=Depends(current_user), conn=Depends(get_conn)):
     sql = """
         SELECT u.id, u.username, u.uid, f.created_at
         FROM friendship f
-        INNER JOIN user u ON u.id = f.friend_id
+        INNER JOIN users u ON u.id = f.friend_id
         WHERE f.user_id = %s
         ORDER BY f.created_at DESC
     """
@@ -591,7 +722,7 @@ def add_friend(target_user_id: int, user=Depends(current_user), conn=Depends(get
     try:
         with conn.cursor() as cur:
             # 确认目标用户存在
-            cur.execute("SELECT id, username FROM user WHERE id = %s", (target_user_id,))
+            cur.execute("SELECT id, username FROM users WHERE id = %s", (target_user_id,))
             target = cur.fetchone()
             if not target:
                 raise HTTPException(status_code=404, detail="用户不存在")
@@ -644,7 +775,7 @@ def list_friend_requests(user=Depends(current_user), conn=Depends(get_conn)):
         SELECT r.id, r.from_user_id, r.status, r.created_at,
                u.username AS from_username, u.uid AS from_uid
         FROM friend_request r
-        INNER JOIN user u ON u.id = r.from_user_id
+        INNER JOIN users u ON u.id = r.from_user_id
         WHERE r.to_user_id = %s AND r.status = 'pending'
         ORDER BY r.created_at DESC
     """

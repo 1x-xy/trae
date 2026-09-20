@@ -2,9 +2,10 @@ import axios from 'axios'
 import { ElMessage } from 'element-plus'
 import router from '../router'
 
-// axios 实例：开发环境走 Vite 代理（同源），生产环境可按需配置 baseURL
+// axios 实例：开发环境走 Vite 代理（baseURL 为空），
+// 生产环境通过 .env.production 的 VITE_API_BASE 指向云端后端地址
 const request = axios.create({
-  baseURL: '/',
+  baseURL: import.meta.env.VITE_API_BASE || '/',
   timeout: 15000
 })
 

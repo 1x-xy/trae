@@ -97,7 +97,7 @@ def client():
             cur.execute("TRUNCATE TABLE friendship")
             cur.execute("TRUNCATE TABLE friend_request")
             cur.execute("TRUNCATE TABLE item_apply")
-            cur.execute("TRUNCATE TABLE user")
+            cur.execute("TRUNCATE TABLE users")
             cur.execute("SET FOREIGN_KEY_CHECKS=1")
         conn.commit()
     finally:
