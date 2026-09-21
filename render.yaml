@@ -24,3 +24,17 @@ services:
         fromDatabase:
           name: item-approval-db
           property: connectionString
+
+  - type: web
+    name: item-approval-frontend
+    runtime: static
+    plan: free
+    rootDir: frontend
+    buildCommand: npm install && npm run build
+    staticPublishPath: ./dist
+    envVars:
+      - key: VITE_API_BASE
+        fromService:
+          name: item-approval-api
+          type: web
+          property: url
