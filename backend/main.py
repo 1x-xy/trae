@@ -21,6 +21,7 @@ from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field, field_validator
 from jose import jwt, JWTError
 
@@ -67,13 +68,148 @@ app.mount("/static", StaticFiles(directory=os.path.join(BASE_DIR, "uploads")), n
 
 
 # ------------------------------------------------------------------
-# 云端部署：PostgreSQL 环境启动时自动建表（免手动执行 SQL）
-# 本地 MySQL 环境仍使用 sql/init.sql 初始化，此函数直接跳过
+# 云端部署：启动时自动建表（免手动执行 SQL），MySQL / PostgreSQL 均支持
 # ------------------------------------------------------------------
 @app.on_event("startup")
-def init_pg_tables():
-    if not _is_postgres():
-        return
+def init_tables():
+    if _is_postgres():
+        _init_pg_tables()
+    else:
+        _init_mysql_tables()
+
+
+def _init_mysql_tables():
+    """MySQL 自动建表（幂等：CREATE TABLE IF NOT EXISTS）。"""
+    import pymysql
+    from pymysql.cursors import DictCursor
+    conn = pymysql.connect(
+        host=DB_HOST, port=DB_PORT, user=DB_USER,
+        password=DB_PASSWORD, database=DB_NAME,
+        charset="utf8mb4", cursorclass=DictCursor, autocommit=False,
+    )
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS `users` (
+                    `id`            BIGINT       NOT NULL AUTO_INCREMENT,
+                    `username`      VARCHAR(50)  NOT NULL,
+                    `password_hash` VARCHAR(255) NOT NULL,
+                    `uid`           VARCHAR(20)  NOT NULL,
+                    `created_at`    DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (`id`),
+                    UNIQUE KEY `uk_user_username` (`username`),
+                    UNIQUE KEY `uk_user_uid` (`uid`)
+                ) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE = utf8mb4_unicode_ci
+                """
+            )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS `item_apply` (
+                    `id`            BIGINT        NOT NULL AUTO_INCREMENT,
+                    `user_id`       BIGINT        NOT NULL,
+                    `item_name`     VARCHAR(100)  NOT NULL,
+                    `price`         DECIMAL(10,2) NOT NULL DEFAULT 0.00,
+                    `description`   TEXT          NULL,
+                    `image_path`    VARCHAR(255)  NOT NULL,
+                    `status`        VARCHAR(20)   NOT NULL DEFAULT 'pending',
+                    `reviewer_id`   BIGINT        NULL,
+                    `review_reason` VARCHAR(500)  NULL,
+                    `reviewed_at`   DATETIME      NULL,
+                    `created_at`    DATETIME      NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (`id`),
+                    KEY `idx_apply_user` (`user_id`),
+                    KEY `idx_apply_status_user` (`status`, `user_id`),
+                    CONSTRAINT `fk_apply_user`
+                        FOREIGN KEY (`user_id`) REFERENCES `users` (`id`),
+                    CONSTRAINT `fk_apply_reviewer`
+                        FOREIGN KEY (`reviewer_id`) REFERENCES `users` (`id`)
+                ) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE = utf8mb4_unicode_ci
+                """
+            )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS `approval_record` (
+                    `id`          BIGINT      NOT NULL AUTO_INCREMENT,
+                    `apply_id`    BIGINT      NOT NULL,
+                    `reviewer_id` BIGINT      NOT NULL,
+                    `action`      VARCHAR(20) NOT NULL,
+                    `reason`      VARCHAR(500) NOT NULL,
+                    `created_at`  DATETIME    NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (`id`),
+                    UNIQUE KEY `uk_apply_reviewer` (`apply_id`, `reviewer_id`),
+                    KEY `idx_ar_reviewer` (`reviewer_id`),
+                    CONSTRAINT `fk_ar_apply`
+                        FOREIGN KEY (`apply_id`) REFERENCES `item_apply` (`id`),
+                    CONSTRAINT `fk_ar_reviewer`
+                        FOREIGN KEY (`reviewer_id`) REFERENCES `users` (`id`)
+                ) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE = utf8mb4_unicode_ci
+                """
+            )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS `message` (
+                    `id`         BIGINT       NOT NULL AUTO_INCREMENT,
+                    `user_id`    BIGINT       NOT NULL,
+                    `apply_id`   BIGINT       NOT NULL,
+                    `content`    VARCHAR(500) NOT NULL,
+                    `is_read`    TINYINT(1)   NOT NULL DEFAULT 0,
+                    `created_at` DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (`id`),
+                    KEY `idx_msg_user_read` (`user_id`, `is_read`),
+                    CONSTRAINT `fk_msg_user`
+                        FOREIGN KEY (`user_id`) REFERENCES `users` (`id`),
+                    CONSTRAINT `fk_msg_apply`
+                        FOREIGN KEY (`apply_id`) REFERENCES `item_apply` (`id`)
+                ) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE = utf8mb4_unicode_ci
+                """
+            )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS `friendship` (
+                    `id`         BIGINT   NOT NULL AUTO_INCREMENT,
+                    `user_id`    BIGINT   NOT NULL,
+                    `friend_id`  BIGINT   NOT NULL,
+                    `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (`id`),
+                    UNIQUE KEY `uk_friend_pair` (`user_id`, `friend_id`),
+                    KEY `idx_friend_user` (`user_id`),
+                    CONSTRAINT `fk_fs_user`
+                        FOREIGN KEY (`user_id`) REFERENCES `users` (`id`),
+                    CONSTRAINT `fk_fs_friend`
+                        FOREIGN KEY (`friend_id`) REFERENCES `users` (`id`)
+                ) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE = utf8mb4_unicode_ci
+                """
+            )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS `friend_request` (
+                    `id`           BIGINT      NOT NULL AUTO_INCREMENT,
+                    `from_user_id` BIGINT      NOT NULL,
+                    `to_user_id`   BIGINT      NOT NULL,
+                    `status`       VARCHAR(20) NOT NULL DEFAULT 'pending',
+                    `created_at`   DATETIME    NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    `handled_at`   DATETIME    NULL,
+                    PRIMARY KEY (`id`),
+                    UNIQUE KEY `uk_req_pair` (`from_user_id`, `to_user_id`),
+                    KEY `idx_req_to` (`to_user_id`, `status`),
+                    CONSTRAINT `fk_req_from`
+                        FOREIGN KEY (`from_user_id`) REFERENCES `users` (`id`),
+                    CONSTRAINT `fk_req_to`
+                        FOREIGN KEY (`to_user_id`) REFERENCES `users` (`id`)
+                ) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE = utf8mb4_unicode_ci
+                """
+            )
+        conn.commit()
+        print("[startup] MySQL 数据表已就绪（自动建表完成）")
+    except Exception as e:
+        conn.rollback()
+        print(f"[startup] MySQL 自动建表失败: {e}")
+    finally:
+        conn.close()
+
+
+def _init_pg_tables():
     import psycopg2
     from psycopg2.extras import RealDictCursor
 
@@ -892,6 +1028,27 @@ def remove_friend(target_user_id: int, user=Depends(current_user), conn=Depends(
     return {"message": "已删除好友"}
 
 
+# 前端构建产物目录（frontend/dist）。若存在则由后端同域托管（PythonAnywhere 单应用部署）
+FRONTEND_DIST = os.path.join(BASE_DIR, "..", "frontend", "dist")
+
+
 @app.get("/")
-def health():
+def home():
+    index = os.path.join(FRONTEND_DIST, "index.html")
+    if os.path.isfile(index):
+        return FileResponse(index)
     return {"status": "ok", "service": "item-approval-api"}
+
+
+# Vue history 路由兜底：所有未匹配的非 API 路径回退到 index.html
+@app.get("/{full_path:path}")
+def spa_fallback(full_path: str):
+    if full_path.startswith("api/") or full_path.startswith("static/"):
+        raise HTTPException(status_code=404, detail="Not Found")
+    file_path = os.path.join(FRONTEND_DIST, full_path)
+    if full_path and os.path.isfile(file_path):
+        return FileResponse(file_path)
+    index = os.path.join(FRONTEND_DIST, "index.html")
+    if os.path.isfile(index):
+        return FileResponse(index)
+    raise HTTPException(status_code=404, detail="Not Found")
