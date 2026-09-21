@@ -28,7 +28,7 @@ from jose import jwt, JWTError
 # ------------------------------------------------------------------
 # 配置（可通过环境变量覆盖，便于本地/部署切换）
 # ------------------------------------------------------------------
-DB_TYPE = os.getenv("DB_TYPE", "mysql").lower()  # mysql 或 postgres
+DB_TYPE = os.getenv("DB_TYPE", "mysql").lower()  # mysql / postgres / sqlite
 DB_HOST = os.getenv("DB_HOST", "127.0.0.1")
 DB_PORT = int(os.getenv("DB_PORT", "3306"))
 DB_USER = os.getenv("DB_USER", "root")
@@ -44,6 +44,11 @@ JWT_EXPIRE_MINUTES = 60 * 24  # token 有效期 1 天
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 UPLOAD_DIR = os.path.join(BASE_DIR, "uploads", "images")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+# SQLite 模式（PythonAnywhere 免费版无 MySQL/PG）：数据存服务器本地文件
+SQLITE_FILE = os.getenv("DB_FILE", "") or os.path.join(BASE_DIR, "item_approval.db")
+if DB_TYPE == "sqlite":
+    os.makedirs(os.path.dirname(SQLITE_FILE), exist_ok=True)
 
 # 图片安全限制：仅 jpg/png/gif，大小不超过 2MB
 ALLOWED_EXT = {".jpg", ".jpeg", ".png", ".gif"}
@@ -68,12 +73,14 @@ app.mount("/static", StaticFiles(directory=os.path.join(BASE_DIR, "uploads")), n
 
 
 # ------------------------------------------------------------------
-# 云端部署：启动时自动建表（免手动执行 SQL），MySQL / PostgreSQL 均支持
+# 云端部署：启动时自动建表（免手动执行 SQL），MySQL / PostgreSQL / SQLite 均支持
 # ------------------------------------------------------------------
 @app.on_event("startup")
 def init_tables():
     if _is_postgres():
         _init_pg_tables()
+    elif DB_TYPE == "sqlite":
+        _init_sqlite_tables()
     else:
         _init_mysql_tables()
 
@@ -309,10 +316,180 @@ def _init_pg_tables():
         conn.close()
 
 
+def _init_sqlite_tables():
+    """SQLite 自动建表（幂等：CREATE TABLE IF NOT EXISTS）。"""
+    import sqlite3
+    conn = sqlite3.connect(SQLITE_FILE)
+    try:
+        cur = conn.cursor()
+        cur.execute("PRAGMA foreign_keys = ON")
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                username      VARCHAR(50)  NOT NULL UNIQUE,
+                password_hash VARCHAR(255) NOT NULL,
+                uid           VARCHAR(20)  NOT NULL UNIQUE,
+                created_at    TEXT NOT NULL DEFAULT (datetime('now','localtime'))
+            )
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS item_apply (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id       INTEGER       NOT NULL REFERENCES users(id),
+                item_name     VARCHAR(100)  NOT NULL,
+                price         REAL          NOT NULL DEFAULT 0,
+                description   TEXT          NULL,
+                image_path    VARCHAR(255)  NOT NULL,
+                status        VARCHAR(20)   NOT NULL DEFAULT 'pending',
+                reviewer_id   INTEGER       NULL REFERENCES users(id),
+                review_reason VARCHAR(500)  NULL,
+                reviewed_at   TEXT          NULL,
+                created_at    TEXT NOT NULL DEFAULT (datetime('now','localtime'))
+            )
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS approval_record (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                apply_id    INTEGER      NOT NULL REFERENCES item_apply(id),
+                reviewer_id INTEGER      NOT NULL REFERENCES users(id),
+                action      VARCHAR(20)  NOT NULL,
+                reason      VARCHAR(500) NOT NULL,
+                created_at  TEXT NOT NULL DEFAULT (datetime('now','localtime')),
+                UNIQUE (apply_id, reviewer_id)
+            )
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS message (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id    INTEGER      NOT NULL REFERENCES users(id),
+                apply_id   INTEGER      NOT NULL REFERENCES item_apply(id),
+                content    VARCHAR(500) NOT NULL,
+                is_read    INTEGER      NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL DEFAULT (datetime('now','localtime'))
+            )
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS friendship (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id    INTEGER NOT NULL REFERENCES users(id),
+                friend_id  INTEGER NOT NULL REFERENCES users(id),
+                created_at TEXT NOT NULL DEFAULT (datetime('now','localtime')),
+                UNIQUE (user_id, friend_id)
+            )
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS friend_request (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                from_user_id INTEGER      NOT NULL REFERENCES users(id),
+                to_user_id   INTEGER      NOT NULL REFERENCES users(id),
+                status       VARCHAR(20)  NOT NULL DEFAULT 'pending',
+                created_at   TEXT NOT NULL DEFAULT (datetime('now','localtime')),
+                handled_at   TEXT         NULL,
+                UNIQUE (from_user_id, to_user_id)
+            )
+            """
+        )
+        conn.commit()
+        print("[startup] SQLite 数据表已就绪（自动建表完成）")
+    except Exception as e:
+        conn.rollback()
+        print(f"[startup] SQLite 自动建表失败: {e}")
+    finally:
+        conn.close()
+
+
 # ------------------------------------------------------------------
-# 数据库连接（每个请求一个连接，根据 DB_TYPE 自动选择 MySQL 或 PostgreSQL）
+# 数据库连接（每个请求一个连接，根据 DB_TYPE 自动选择 MySQL / PostgreSQL / SQLite）
 # ------------------------------------------------------------------
+class _SqliteCursor:
+    """SQLite 游标包装器：把 MySQL 风格的 %s 占位符翻译成 SQLite 的 ?，
+    并抹掉 SQLite 不支持的语法，其余能力委托给原生 sqlite3 游标。
+    返回 rowcount 以兼容 pymysql 的 execute() 语义（如 affected == 0 判断）。"""
+
+    def __init__(self, cur):
+        self._cur = cur
+
+    @staticmethod
+    def _translate(sql: str) -> str:
+        sql = sql.replace("%s", "?").replace("INSERT IGNORE INTO", "INSERT OR IGNORE INTO")
+        import re as _re
+        return _re.sub(r"\s+FOR UPDATE", "", sql, flags=_re.IGNORECASE)
+
+    def execute(self, sql, params=None):
+        sql = self._translate(sql)
+        if params is None:
+            self._cur.execute(sql)
+        else:
+            self._cur.execute(sql, params)
+        return self._cur.rowcount
+
+    def executemany(self, sql, seq):
+        self._cur.executemany(self._translate(sql), seq)
+        return self._cur.rowcount
+
+    def fetchone(self):
+        return self._cur.fetchone()
+
+    def fetchall(self):
+        return self._cur.fetchall()
+
+    def fetchmany(self, size=None):
+        return self._cur.fetchmany(size)
+
+    def close(self):
+        self._cur.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def __getattr__(self, name):
+        return getattr(self._cur, name)
+
+
+class _SqliteConn:
+    """SQLite 连接包装器：提供与 pymysql 连接相同的 cursor()/commit()/rollback()/close() 接口。"""
+
+    def __init__(self, conn):
+        self._conn = conn
+
+    def cursor(self):
+        return _SqliteCursor(self._conn.cursor())
+
+    def commit(self):
+        self._conn.commit()
+
+    def rollback(self):
+        self._conn.rollback()
+
+    def close(self):
+        self._conn.close()
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+
 def get_conn():
+    if DB_TYPE == "sqlite":
+        import sqlite3
+        conn = sqlite3.connect(SQLITE_FILE, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys = ON")
+        yield _SqliteConn(conn)
+        return
     if DB_TYPE == "postgres" or DATABASE_URL:
         import psycopg2
         from psycopg2.extras import RealDictCursor
@@ -386,8 +563,10 @@ def create_token(user_id: int, username: str) -> str:
     return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
 
 
-def jsonable(row: dict) -> dict:
-    """把 MySQL 返回的 datetime / Decimal 转成 JSON 友好类型。"""
+def jsonable(row) -> dict:
+    """把数据库返回的 datetime / Decimal 转成 JSON 友好类型（兼容 dict 与 sqlite3.Row）。"""
+    if not isinstance(row, dict):
+        row = dict(row)
     for key, value in list(row.items()):
         if isinstance(value, datetime):
             row[key] = value.strftime("%Y-%m-%d %H:%M:%S")
@@ -582,7 +761,7 @@ def my_applications(user=Depends(current_user), conn=Depends(get_conn)):
                ORDER BY a.created_at DESC""",
             (user["id"],),
         )
-        apps = cur.fetchall()
+        apps = [dict(r) for r in cur.fetchall()]  # sqlite3.Row 不可变，先转 dict
 
         # 2. 查这些申请的所有审批记录
         app_ids = [a["id"] for a in apps]
@@ -599,6 +778,7 @@ def my_applications(user=Depends(current_user), conn=Depends(get_conn)):
                 app_ids,
             )
             for row in cur.fetchall():
+                row = dict(row)  # sqlite3.Row 不可变，先转 dict 再 pop
                 aid = row.pop("apply_id")
                 approvals_map.setdefault(aid, []).append(jsonable(row))
 
